@@ -1,0 +1,2 @@
+PySide6-Essentials>=6.10
+Pygments>=2.17

@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+test-project/
+.claude/settings.local.json
