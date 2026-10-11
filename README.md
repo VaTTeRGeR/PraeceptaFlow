@@ -1,10 +1,12 @@
 # PraeceptaFlow
 
-Add structure to your vibe-coded projects. Describe your program as a flow graph, and [Claude Code](https://claude.com/claude-code) translates it into source code. Each flow graph item is linked to the code generated for it, so you can understand what the agent built in an instant. Be as detailed or as vague as you like: there is no syntax, only structure!
+Add structure to your vibe-coded projects! Describe your program as a flow graph, let [Claude](https://claude.com/claude-code) translate it into source code.
+
+Flow graph items are associated with code generated based on them, this lets you understand what the agent built by pointing back to specific parts of your graph. Be as detailed or as vague as you like: there is no syntax, only structure!
 
 ![A flow graph for an ESP32 stepper driver firmware on the left, with the selected box's code highlighted](demo-screenshot.png)
 
-Built with PySide6 (Qt's Graphics View framework). This is a proof-of-concept for now: Windows only, hardly any tests, and the file format may change at any time.
+Built with PySide6 (Qt's Graphics View framework).
 
 ## Requirements
 
@@ -14,6 +16,7 @@ Built with PySide6 (Qt's Graphics View framework). This is a proof-of-concept fo
 
 ## Setup
 
+This creates a local .venv in the programs folder and pulls required python dependencies into that venv.
 ```
 setup.bat
 ```
