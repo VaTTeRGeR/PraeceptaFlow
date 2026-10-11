@@ -4,10 +4,10 @@ from pathlib import Path
 
 from editor.export import MIN_HASH_LENGTH
 
-# A tag comment in any comment syntax: only punctuation (or `rem`) before the tag, `end` after it for the end marker.
-_MARKER = re.compile(rf"^\s*(?:rem\b|\W{{1,4}})\s*\[([0-9a-f]{{{MIN_HASH_LENGTH},}})\]\s*(end\b)?", re.IGNORECASE)
-# The description and the graph hold tags too, but they are not source code.
-_SKIPPED_SUFFIXES = {".pd", ".pfg", ".notes"}
+# A tag comment in any comment syntax: only punctuation (or `rem`, never just spaces) before the tag, `end` after it for the end marker.
+_MARKER = re.compile(rf"^\s*(?:rem\b|[^\w\s]{{1,4}})\s*\[([0-9a-f]{{{MIN_HASH_LENGTH},}})\]\s*(end\b)?", re.IGNORECASE)
+# The description and the graph hold tags too, and a readme may list them, but they are not source code.
+_SKIPPED_SUFFIXES = {".pd", ".pfg", ".notes", ".issues", ".md"}
 _SKIPPED_DIRS = {"__pycache__", "node_modules", "venv"}
 _MAX_BYTES = 1_000_000
 

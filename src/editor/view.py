@@ -41,8 +41,8 @@ class EditorView(QGraphicsView):
         self._scale_by(1 / self.zoom(), QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
     def fit_all(self) -> None:
-        """Show every item, without magnifying beyond 100%."""
-        rect = self.scene().itemsBoundingRect()
+        """Show every item of the canvas shown, without magnifying beyond 100%."""
+        rect = self.scene().visible_rect()
         if rect.isEmpty():
             self.reset_zoom()
             self.centerOn(0, 0)

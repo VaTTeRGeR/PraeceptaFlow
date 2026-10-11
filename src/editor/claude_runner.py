@@ -31,7 +31,7 @@ NOTES_SCHEMA = {
 PARITY_PROMPT = (
     "Check that the source code in the current directory matches the project description on stdin. "
     "Do not change any file. Report one entry per step tag of the description, with the tag without "
-    "its brackets; the tags of notes are not steps and get no entry. Its status is `unimplemented` if no code carries the tag; `match` if the code is "
+    "its brackets; the tags of notes and of logical groups are not steps and get no entry. Its status is `unimplemented` if no code carries the tag; `match` if the code is "
     "delimited by its tag and end comments, does what the step and its notes say, and continues as "
     "its Next: links say; otherwise `mismatch`. The reason is one sentence saying what differs, "
     "empty for a match. Under `other` list code that implements no step and tags that are not in "
@@ -57,7 +57,12 @@ PARITY_SCHEMA = {
     },
     "required": ["steps"],
 }
-GENERATE_ARGS = ["--permission-mode", "acceptEdits", "--json-schema", json.dumps(NOTES_SCHEMA)]
+# The instructions forbid running commands; denying the shell tools holds whatever the user's settings allow.
+GENERATE_ARGS = [
+    "--permission-mode", "acceptEdits",
+    "--disallowedTools", "Bash,PowerShell",
+    "--json-schema", json.dumps(NOTES_SCHEMA),
+]
 PARITY_ARGS = [
     "--allowedTools", "Read,Glob,Grep",
     "--disallowedTools", "Edit,Write,NotebookEdit,Bash,PowerShell",
@@ -212,6 +217,8 @@ class ClaudeRunner(QObject):
         try:
             event = json.loads(line)
         except ValueError:
+            event = None
+        if not isinstance(event, dict):
             if line:
                 self.message.emit(line)  # not an event: plain output such as an error message
             return

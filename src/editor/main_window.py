@@ -1,8 +1,9 @@
+import html
 import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QSettings, Qt, QTimer, QUrl, qVersion
+from PySide6.QtCore import QEvent, QPointF, QSettings, Qt, QTimer, QUrl, qVersion
 from PySide6.QtGui import QAction, QActionGroup, QCursor, QDesktopServices, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,8 +28,15 @@ from editor.claude_runner import (
 )
 from editor.commands import AddItemCommand, DeleteItemsCommand
 from editor.code_view import CodeView
-from editor.export import NOTE_HEADINGS, PROJECT_NOTE_KIND, project_description
-from editor.items import NODE_KINDS, PARITY_MARKS, NodeItem
+from editor.export import (
+    NOTE_HEADINGS,
+    PROJECT_NOTE_KIND,
+    first_line,
+    issues_section,
+    project_description,
+    tagged_items,
+)
+from editor.items import NODE_KINDS, PARITY_MARKS, NodeItem, RegionItem, group_chain, make_node
 from editor.scene import EditorScene
 from editor.source_map import scan
 from editor.view import EditorView
@@ -40,6 +48,10 @@ FILE_FILTER = f"Project flow graphs (*{FILE_SUFFIX});;All files (*)"
 EXPORT_SUFFIX = ".pd"
 # How the last generation realized each note, as JSON {tag: text} beside the graph (source_map skips it).
 NOTES_SUFFIX = ".notes"
+# The report of the last parity check, as JSON beside the graph: {"steps": {tag: {status, reason, step}},
+# "other": [...]}. `step` is the step's item of the description that was checked; a verdict is only shown
+# while the graph still yields the same item, which is how a later change to the node hides it.
+ISSUES_SUFFIX = ".issues"
 NOTE_KINDS = (PROJECT_NOTE_KIND, *NOTE_HEADINGS)
 RECENT_KEY = "recentFiles"
 MAX_RECENT = 10
@@ -51,6 +63,10 @@ class MainWindow(QMainWindow):
         # Per-user settings (the registry on Windows); tests can pass a throwaway QSettings.
         self._settings = settings or QSettings(ORG_NAME, APP_NAME)
         self._path: Path | None = None
+        self._run_path: Path | None = None  # the graph the current claude run was started on
+        self._run_text = ""  # the description that run was given
+        self._has_code = False  # whether the last scan found tagged source code
+        self._has_notes = False  # whether the graph had a notes file at the last scan
         self._text_dirty = False
         self._insert_count = 0
         self._insert_pos: QPointF | None = None  # set while the canvas context menu is open
@@ -59,6 +75,12 @@ class MainWindow(QMainWindow):
         self._undo_stack = QUndoStack(self)
         self._scene = EditorScene(self._undo_stack, self)
         self._view = EditorView(self._scene, self)
+        # The way back out of a group: the groups around the canvas shown, as links, over its top left corner.
+        self._crumbs = QLabel(self._view)
+        self._crumbs.setStyleSheet("background: #ffffff; border: 1px solid #d9dee4; padding: 3px 6px;")
+        self._crumbs.move(8, 8)
+        self._crumbs.linkActivated.connect(self._enter_group_id)
+        self._crumbs.hide()
         self._code_view = CodeView(self)
         self._code_view_sized = False
         # What the last generation did with the selected note, above the code.
@@ -92,9 +114,9 @@ class MainWindow(QMainWindow):
         self._claude.finished.connect(lambda: self._set_claude_busy(False))
         self._claude.finished.connect(self._update_code_view)
         self._claude.result.connect(self._show_result)
-        # A verdict is about the graph and code as they were checked, so any edit removes the badges.
-        self._undo_stack.indexChanged.connect(self._clear_parity)
-        self._scene.text_edited.connect(self._clear_parity)
+        # A verdict is about a step as it was checked, so an edit can hide (and an undo bring back) its badge.
+        self._undo_stack.indexChanged.connect(self._show_issues)
+        self._scene.text_edited.connect(self._show_issues)
 
         # The model and effort passed to claude; None means "Default": no flag, so claude's own
         # settings decide. The choices come from claude itself (ClaudeSetup) once it has answered.
@@ -107,7 +129,7 @@ class MainWindow(QMainWindow):
 
         self._create_menus()
 
-        hint = "Drag from a box's border to connect  |  Double-click to edit text (Enter: new line, Ctrl+Enter: done)  |  Ctrl+wheel zooms  |  Middle-drag pans"
+        hint = "Drag from a box's border to connect  |  Double-click to edit text (Enter: new line, Ctrl+Enter: done) or enter a group  |  Ctrl+wheel zooms  |  Middle-drag pans"
         self.statusBar().addWidget(QLabel(hint))
         self._zoom_label = QLabel()
         self.statusBar().addPermanentWidget(self._zoom_label)
@@ -117,7 +139,10 @@ class MainWindow(QMainWindow):
 
         self._undo_stack.cleanChanged.connect(self._update_modified)
         self._scene.text_edited.connect(self._on_text_edited)
-        self._scene.selectionChanged.connect(self._update_code_view)
+        self._scene.selectionChanged.connect(self._show_selection)
+        self._scene.text_edited.connect(self._update_crumbs)
+        self._scene.group_changed.connect(self._update_crumbs)
+        self._scene.group_changed.connect(self._view.fit_all)
         self._update_title()
 
     # --- menus -----------------------------------------------------------
@@ -154,9 +179,12 @@ class MainWindow(QMainWindow):
 
         insert_menu = self.menuBar().addMenu("&Insert")
         self._insert_menu = insert_menu
-        for number, (key, kind) in enumerate(NODE_KINDS.items(), start=1):
+        insertable = [(key, kind) for key, kind in NODE_KINDS.items() if kind.insert]
+        for number, (key, kind) in enumerate(insertable, start=1):
             insert = lambda _checked=False, key=key: self._insert_box(key)
             self._add_action(insert_menu, f"&{number} {kind.label}", insert, f"Ctrl+{number}")
+        insert = lambda _checked=False: self._insert(RegionItem(), "Add Logical Group")
+        self._add_action(insert_menu, "&Logical Group", insert)
         # A pick from the menu bar is not a pointer-on-canvas insert. The menu hides before
         # the action fires, so the flag is only cleared once that event has been handled.
         insert_menu.aboutToShow.connect(lambda: setattr(self, "_insert_menu_open", True))
@@ -169,6 +197,7 @@ class MainWindow(QMainWindow):
         self._add_action(view_menu, "Zoom &Out", self._view.zoom_out, "Ctrl+-")
         self._add_action(view_menu, "&Reset Zoom", self._view.reset_zoom, "Ctrl+0")
         self._add_action(view_menu, "&Fit All", self._view.fit_all, "Ctrl+Shift+F")
+        self._add_action(view_menu, "&Leave Group", self._leave_group, "Alt+Up")
         view_menu.addSeparator()
         self._code_action = self._add_action(view_menu, "&Source Code", self._update_code_view)
         self._code_action.setCheckable(True)
@@ -275,6 +304,10 @@ class MainWindow(QMainWindow):
         return answer == buttons.Discard
 
     def closeEvent(self, event) -> None:
+        # Save first: cancelling here must not have stopped claude already.
+        if not self._maybe_save():
+            event.ignore()
+            return
         if self._claude.is_running():
             answer = QMessageBox.question(self, "Claude is running", "Stop Claude and close the editor?")
             if answer != QMessageBox.StandardButton.Yes:
@@ -282,13 +315,16 @@ class MainWindow(QMainWindow):
                 return
             self._claude.stop()
         self._claude_setup.stop()
-        if self._maybe_save():
-            # Still modified means the changes were discarded, so the description already matches the file.
-            if self._path and not self.isWindowModified():
-                self._export_beside(self._path)
-            event.accept()
-        else:
-            event.ignore()
+        # Still modified means the changes were discarded, so the description already matches the file.
+        if self._path and not self.isWindowModified():
+            self._export_beside(self._path)
+        event.accept()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        # The source files may have been edited in another program meanwhile.
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._update_code_view()
 
     # --- file actions ----------------------------------------------------
 
@@ -352,7 +388,10 @@ class MainWindow(QMainWindow):
         path = Path(path)
         self._scene.setFocusItem(None)  # commit a text edit in progress
         try:
-            path.write_text(json.dumps(self._scene.to_dict(), indent=2), encoding="utf-8")
+            # Written beside the graph and swapped in, so a failed write leaves the old file intact.
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(self._scene.to_dict(), indent=2), encoding="utf-8")
+            os.replace(temporary, path)
         except OSError as exc:
             QMessageBox.critical(self, "Save failed", f"Could not save {path}:\n{exc}")
             return False
@@ -438,36 +477,75 @@ class MainWindow(QMainWindow):
         return args + (["--effort", self._effort] if self._effort else [])
 
     def _generate(self) -> None:
-        self._run_claude("Generate source code", GENERATE_PROMPT, GENERATE_ARGS)
+        self._run_claude("Generate source code", GENERATE_PROMPT, GENERATE_ARGS, generate=True)
 
     def _check_parity(self) -> None:
         self._run_claude("Check parity", PARITY_PROMPT, PARITY_ARGS)
 
-    def _run_claude(self, title: str, prompt: str, args: list[str]) -> None:
-        """Run claude on the project description beside the saved graph, in that folder."""
-        if not self._maybe_save():  # also rewrites the description when there were changes
-            return
-        if self._path is None:
-            QMessageBox.information(self, title, "Save the flow graph first.")
+    def _run_claude(self, title: str, prompt: str, args: list[str], generate: bool = False) -> None:
+        """Run claude on the project description of the saved graph, in the graph's folder."""
+        self._scene.setFocusItem(None)  # commit a text edit in progress
+        # Saved without asking: the run must be about the graph on the canvas, so there is nothing to discard.
+        if (self._path is None or self.isWindowModified()) and not self._save():
             return
         description = self._path.with_suffix(EXPORT_SUFFIX)
-        try:
-            text = description.read_text(encoding="utf-8")
-        except OSError as exc:
-            QMessageBox.critical(self, title, f"Could not read {description}:\n{exc}")
-            return
-        self._clear_parity()
+        others = [
+            p.name for p in description.parent.glob(f"*{FILE_SUFFIX}")
+            if os.path.normcase(p.name) != os.path.normcase(self._path.name)
+        ]
+        if generate and others:
+            # A generation removes the code of tags it does not know, which is the other graphs' code.
+            question = (
+                f"This folder also holds {', '.join(others)}. Generating can remove the source code "
+                "of other graphs in the same folder. Continue?"
+            )
+            if QMessageBox.question(self, title, question) != QMessageBox.StandardButton.Yes:
+                return
+        text = project_description(self._scene.to_dict())
+        self._run_path = self._path
+        self._run_text = text
         self._claude_log.setPlainText(f"{title}: {description}")
         self._claude_dock.show()
         self._set_claude_busy(True)
-        self._claude.start(prompt, text, description.parent, [*args, *self._model_args()])
+        # A generation is also told what the last check found wrong, so it can fix that.
+        issues = issues_section(*self._issues()) if generate else ""
+        self._claude.start(prompt, text + issues, description.parent, [*args, *self._model_args()])
 
     def _nodes(self) -> list[NodeItem]:
-        return [item for item in self._scene.items() if isinstance(item, NodeItem)]
+        """The boxes of all canvases; not the cases, which are part of their decision."""
+        return [item for item in self._scene.items() if isinstance(item, NodeItem) and item.decision is None]
 
-    def _clear_parity(self, *_) -> None:
+    def _issues(self) -> tuple[dict[str, dict], list[str]]:
+        """The verdicts of the last parity check for the steps that did not change since, and its other findings."""
+        if self._path is None:
+            return {}, []
+        try:
+            report = json.loads(self._path.with_suffix(ISSUES_SUFFIX).read_text(encoding="utf-8"))
+        except (OSError, ValueError):  # no file, or not JSON
+            return {}, []
+        if not isinstance(report, dict):
+            return {}, []
+        steps, other = report.get("steps"), report.get("other")
+        current = tagged_items(project_description(self._scene.to_dict()))
+        # The file may have been edited by hand: only an entry with a known status counts.
+        shown = {
+            tag: {"status": entry["status"], "reason": str(entry.get("reason", ""))}
+            for tag, entry in (steps.items() if isinstance(steps, dict) else ())
+            if isinstance(entry, dict)
+            and isinstance(entry.get("status"), str)
+            and entry["status"] in PARITY_MARKS
+            and tag in current
+            and entry.get("step") == current[tag]
+        }
+        return shown, [str(line) for line in other] if isinstance(other, list) else []
+
+    def _show_issues(self, *_) -> None:
+        """Badge each box with its verdict of the last parity check, unless its step changed since then."""
+        shown, _ = self._issues()
         for node in self._nodes():
-            node.set_parity(None)
+            # The same rule that maps tag comments to nodes.
+            entry = next((e for tag, e in shown.items() if tag and node.id.startswith(tag)), {})
+            node.set_parity(entry.get("status"), entry.get("reason", ""))
 
     def _show_result(self, result: dict) -> None:
         """The structured output of a run: note feedback from a generation, verdicts from a parity check."""
@@ -482,11 +560,14 @@ class MainWindow(QMainWindow):
             str(entry.get("tag", "")).strip("[]"): str(entry.get("realization", ""))
             for entry in result["notes"] if isinstance(entry, dict) and entry.get("tag")
         }
-        target = self._path.with_suffix(NOTES_SUFFIX)
+        target = self._run_path.with_suffix(NOTES_SUFFIX)
         try:
             target.write_text(json.dumps(notes, indent=2), encoding="utf-8")
+            # The code was rewritten, so the last parity check no longer describes it.
+            self._run_path.with_suffix(ISSUES_SUFFIX).unlink(missing_ok=True)
         except OSError as exc:
-            self._claude_log.appendPlainText(f"Could not write {target}: {exc}")
+            # Either file may have failed: the notes, or the issues file that was to go.
+            self._claude_log.appendPlainText(f"Could not write {exc.filename or target}: {exc.strerror}")
             return
         self._claude_log.appendPlainText(f"{len(notes)} notes reported.")
 
@@ -500,20 +581,28 @@ class MainWindow(QMainWindow):
             return "No feedback from the last generation."
 
     def _show_parity(self, result: dict) -> None:
-        """Mark each step's box with its verdict and list the verdicts in the log."""
+        """List the verdicts in the log and keep them beside the graph that was checked, then mark the boxes."""
         counts: dict[str, int] = {}
+        checked = tagged_items(self._run_text)
+        steps = {}
         for entry in result.get("steps", []):
             tag, status, reason = str(entry.get("tag", "")).strip("[]"), entry.get("status"), entry.get("reason", "")
             if not tag or status not in PARITY_MARKS:
                 continue
             counts[status] = counts.get(status, 0) + 1
-            for node in self._nodes():
-                if node.id.startswith(tag):  # the same rule that maps tag comments to nodes
-                    node.set_parity(status, reason or status.capitalize())
+            if tag in checked:
+                steps[tag] = {"status": status, "reason": reason or status.capitalize(), "step": checked[tag]}
             self._claude_log.appendPlainText(f"{PARITY_MARKS[status][0]} [{tag}] {reason}".rstrip())
-        for line in result.get("other", []):
+        other = [str(line) for line in result.get("other", [])]
+        for line in other:
             self._claude_log.appendPlainText(f"! {line}")
         self._claude_log.appendPlainText(", ".join(f"{n} {status}" for status, n in counts.items()) or "No steps reported.")
+        target = self._run_path.with_suffix(ISSUES_SUFFIX)
+        try:
+            target.write_text(json.dumps({"steps": steps, "other": other}, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._claude_log.appendPlainText(f"Could not write {target}: {exc}")
+        self._show_issues()
 
     def _set_claude_busy(self, busy: bool) -> None:
         self._generate_action.setEnabled(not busy)
@@ -521,21 +610,28 @@ class MainWindow(QMainWindow):
         self._stop_action.setEnabled(busy)
 
     def _update_code_view(self, *_) -> None:
-        """Keep the code pane in step with the folder and the selected node.
-
-        The pane stays open while there is tagged source code; selecting a node only marks and scrolls to its code.
-        """
+        """Read the folder's source code again and show it; the pane stays open while there is any."""
         folder = self._path.parent if self._path else None
         files = scan(folder) if folder else []
         self._code_view.set_files(folder, files)
+        self._has_code = bool(files)
+        self._has_notes = bool(self._path) and self._path.with_suffix(NOTES_SUFFIX).is_file()
+        self._show_selection()
+        self._show_issues()
+
+    def _show_selection(self) -> None:
+        """Mark and scroll to the selected node's code, or show a note's feedback; reads no source files."""
         items = self._scene.selectedItems()
-        node = items[0] if len(items) == 1 and isinstance(items[0], NodeItem) else None
-        self._code_view.highlight(node.id if node else None)
-        note = self._note_feedback(node) if node and node.kind_key in NOTE_KINDS else ""
+        item = items[0] if len(items) == 1 and isinstance(items[0], (NodeItem, RegionItem)) else None
+        self._code_view.highlight(item.id if item else None)
+        node = item if isinstance(item, NodeItem) else None
+        # Open or closed by what the last generation left, never by the selection: that would shift the canvas.
+        shown = self._has_code or self._has_notes
+        note = self._note_feedback(node) if shown and node and node.kind_key in NOTE_KINDS else ""
         self._note_label.setText(note)
         self._note_label.setVisible(bool(note))
-        self._code_view.setVisible(bool(files))
-        if not (files or note) or not self._code_action.isChecked():
+        self._code_view.setVisible(self._has_code)
+        if not shown or not self._code_action.isChecked():
             self._code_pane.hide()
         elif self._code_pane.isHidden():
             self._code_pane.show()
@@ -555,7 +651,26 @@ class MainWindow(QMainWindow):
 
     def _select_all(self) -> None:
         for item in self._scene.items():
-            item.setSelected(True)
+            if item.isVisible():  # the other canvases are in the scene too
+                item.setSelected(True)
+
+    # --- groups ----------------------------------------------------------
+
+    def _leave_group(self) -> None:
+        if self._scene.current_group is not None:
+            self._scene.enter_group(self._scene.current_group.group)
+
+    def _enter_group_id(self, group_id: str) -> None:
+        """A link of the breadcrumb: a group's id, or anything else for the main canvas."""
+        self._scene.enter_group(next((node for node in self._nodes() if node.id == group_id), None))
+
+    def _update_crumbs(self) -> None:
+        chain = group_chain(self._scene.current_group)
+        names = [html.escape(first_line(node.title) or "Group") for node in chain]
+        links = ['<a href="main">Main</a>', *(f'<a href="{node.id}">{name}</a>' for node, name in zip(chain, names))]
+        self._crumbs.setText(" › ".join([*links[:-1], f"<b>{names[-1]}</b>"]) if chain else "")
+        self._crumbs.adjustSize()
+        self._crumbs.setVisible(bool(chain))
 
     def _show_canvas_menu(self, global_pos, scene_pos: QPointF) -> None:
         # The context menu is the Insert menu; its actions read the click position from here.
@@ -585,12 +700,13 @@ class MainWindow(QMainWindow):
             centre = self._view.mapToScene(self._view.viewport().rect().center())
             pos = QPointF(centre.x() + offset, centre.y() + offset)
         item.setPos(QPointF(round(pos.x() / grid) * grid, round(pos.y() / grid) * grid))
+        item.group = self._scene.current_group
         self._undo_stack.push(AddItemCommand(self._scene, item, text))
         self._scene.clearSelection()
         item.setSelected(True)
 
     def _insert_box(self, kind: str) -> None:
-        self._insert(NodeItem("Box", kind=kind), f"Add {NODE_KINDS[kind].label}")
+        self._insert(make_node(kind), f"Add {NODE_KINDS[kind].label}")
 
     # --- misc ------------------------------------------------------------
 

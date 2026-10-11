@@ -5,4 +5,6 @@ build/
 dist/
 *.spec
 test-project/
+test-esp32/
+*.pfg.tmp
 .claude/settings.local.json
