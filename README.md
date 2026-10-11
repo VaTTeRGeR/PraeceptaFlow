@@ -15,12 +15,15 @@ Built with PySide6 (Qt's Graphics View framework).
 
 ## Setup
 
-This creates a local .venv in the programs folder and pulls required python dependencies into that venv.
-```
-% Windows
-setup.bat
+Thie setup sript creates a local .venv in the programs folder and pulls required python dependencies into the venv.
 
-% Linux/ macOS
+On Windows:
+```
+setup.bat
+```
+
+On Linux / macOS:
+```
 ./setup.sh
 ```
 
