@@ -10,7 +10,6 @@ Built with PySide6 (Qt's Graphics View framework).
 
 ## Requirements
 
-- Windows
 - Python 3.14 or later
 - `claude` command on `PATH` and logged in
 
@@ -18,17 +17,21 @@ Built with PySide6 (Qt's Graphics View framework).
 
 This creates a local .venv in the programs folder and pulls required python dependencies into that venv.
 ```
+% Windows
 setup.bat
+
+% Linux/ macOS
+./setup.sh
 ```
 
 ## Scripts
 
-| Task | Command |
-|---|---|
-| Run the app | `run.bat [file.pfg]` |
-| Run the app with a console window | `run_console.bat [file.pfg]` |
-| Build a PyInstaller bundle | `build.bat [--onefile]` |
-| Remove `build\` and `dist\` | `clean.bat` |
+| Task | Windows | Linux, macOS |
+|---|---|---|
+| Run the app | `run.bat [file.pfg]` | `./run.sh [file.pfg]` |
+| Run the app with a console window | `run_console.bat [file.pfg]` | `./run.sh [file.pfg]` |
+| Build a PyInstaller bundle | `build.bat [--onefile]` | `./build.sh [--onefile]` (macOS: an `.app`, no `--onefile`) |
+| Remove `build\` and `dist\` | `clean.bat` | `rm -rf build dist` |
 
 ## Usage
 
